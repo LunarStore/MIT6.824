@@ -46,7 +46,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-
+	CommandTerm  int32
 	// For 2D:
 	SnapshotValid bool
 	Snapshot      []byte
@@ -107,6 +107,7 @@ type Raft struct {
 	nextIndex  []int32
 	matchIndex []int32
 
+	snapshotCount int32
 	// logFile *os.File
 }
 
@@ -120,6 +121,9 @@ func (rf *Raft) GetLog(index int32) LogEntry {
 }
 func (rf *Raft) GetLength() int32 {
 	return rf.lastIncludeIndex + 1 + int32(len(rf.logs))
+}
+func (rf *Raft) GetRealLength() int32 {
+	return int32(len(rf.logs))
 }
 
 func (rf *Raft) Slice(begin int, end int) []LogEntry {
@@ -240,6 +244,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+func (rf *Raft) RaftStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) ReadSnapshot() []byte {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.persister.ReadSnapshot()
+}
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -247,40 +265,35 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) { //上层应用调用Snapshot时，同时有个协程正在持有锁去向上层apply数据（上层应用因为调用Snapshot阻塞无法响应applyCh），此时会发生死锁。
 	// Your code here (2D).
 
-	// rf.mu.Lock()
-	// rf.DebugPrint("manual Snapshot start")
-	// defer rf.mu.Unlock()
+	rf.mu.Lock()
+	rf.DebugPrint("manual Snapshot start")
+	defer rf.mu.Unlock()
 
-	// if index <= int(rf.lastIncludeIndex) { //is need equal?
-	// 	return
-	// }
-
-	// // 更新快照日志
-	// lastSnapshotLog := rf.GetLog(int32(index)) //GetLog和lastIncludeIndex存在依赖
-	// tailLogs := make([]LogEntry, 0)
-	// for i := index + 1; i < int(rf.GetLength()); i++ {
-	// 	tailLogs = append(tailLogs, rf.GetLog(int32(i)))
-	// }
-
-	// rf.lastIncludeIndex = int32(index)
-	// rf.lastIncludeTerm = lastSnapshotLog.Term
-	// rf.logs = tailLogs
-
-	// // if int32(index) > rf.commitIndex {
-	// // 	rf.commitIndex = int32(index)
-	// // }
-	// // if int32(index) > rf.lastApplied {
-	// // 	rf.lastApplied = int32(index)
-	// // }
-	// rf.persist()
-	// rf.persister.SaveSnapshot(snapshot)
-
-	// rf.DebugPrint("manual Snapshot end")
-	rf.wakeupSnapshot <- ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      snapshot,
-		SnapshotIndex: index,
+	if index <= int(rf.lastIncludeIndex) || rf.snapshotCount != 0 { //is need equal?//保证快照应用的原子性
+		return
 	}
+
+	// 更新快照日志
+	lastSnapshotLog := rf.GetLog(int32(index)) //GetLog和lastIncludeIndex存在依赖
+	tailLogs := make([]LogEntry, 0)
+	for i := index + 1; i < int(rf.GetLength()); i++ {
+		tailLogs = append(tailLogs, rf.GetLog(int32(i)))
+	}
+
+	rf.lastIncludeIndex = int32(index)
+	rf.lastIncludeTerm = lastSnapshotLog.Term
+	rf.logs = tailLogs
+
+	if int32(index) > rf.commitIndex {
+		rf.commitIndex = int32(index)
+	}
+	if int32(index) > rf.lastApplied {
+		rf.lastApplied = int32(index)
+	}
+	rf.persist()
+	rf.persister.SaveSnapshot(snapshot)
+
+	rf.DebugPrint("manual Snapshot end")
 	return
 }
 
@@ -309,6 +322,9 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
 		//change to follower
+		if rf.state == Leader { // leader 不具备选举超时，在更换状态时，需开启选举超时
+			rf.electTimer.Reset(RandomTimeout())
+		}
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = int32(args.LeaderId) // rf.votedFor = -1 //变成Follower重新拥有一次投票权
@@ -321,7 +337,7 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 		reply.Success = false
 		return
 	}
-	rf.electTimer.Reset(RandomTimeout())
+	rf.electTimer.Reset(RandomTimeout()) //这里直接重置定时器的话会导致TestFigure8Unreliable2C无法达成一致而失败，因为后面是有判断当前追加日志的请求是否有效，无效的会直接返回！！！
 	reply.Term = rf.currentTerm
 
 	if args.Entries == nil { //	收到心跳
@@ -395,7 +411,12 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 
 		rf.DebugPrint("will to apply AppendEntries <args: term=%v, LeaderId=%v, prevLogIndex=%v, preLogTerm=%v, LeaderCommit=%v, EntriesLength=%v>", args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
 		// rf.ApplyToStateMachine()
-		rf.wakeupApply <- rf.commitIndex
+		//非阻塞写
+		select {
+		case rf.wakeupApply <- rf.commitIndex:
+		default:
+		}
+
 	}
 }
 
@@ -430,49 +451,35 @@ func (rf *Raft) ApplyToStateMachine() {
 			// 	continue
 			// }
 			rf.mu.Lock()
+			if rf.snapshotCount != 0 { //保证快照应用的原子性
+				rf.mu.Unlock()
+				continue
+			}
 			commitIndex, lastApplied := rf.commitIndex, rf.lastApplied
 			entries := make([]LogEntry, commitIndex-lastApplied)
 			rf.DebugPrint("begin apply len(logs) = %v len(ApplyEntries) = %v\n", len(rf.logs), len(entries))
 			copy(entries, rf.Slice(int(lastApplied+1), int(commitIndex+1))) //+1
-			// rf.mu.Unlock()
+			rf.mu.Unlock()
 			for _, entry := range entries {
 				rf.applyCh <- entry.Command
 			}
-			// rf.mu.Lock()
+			rf.mu.Lock()
+			if rf.snapshotCount != 0 { //保证快照应用的原子性
+				rf.mu.Unlock()
+				continue
+			}
 			rf.DebugPrint("end apply rf.lastApplied = MAX(rf.lastApplied = %v, commitIndex = %v)\n", rf.lastApplied, commitIndex)
 			rf.lastApplied = Max(rf.lastApplied, commitIndex)
 			rf.mu.Unlock()
 		case msg := <-rf.wakeupSnapshot:
 			rf.mu.Lock()
-			rf.DebugPrint("manual Snapshot start SnapshotIndex = %v", msg.SnapshotIndex)
-
-			if msg.SnapshotIndex <= int(rf.lastIncludeIndex) { //is need equal?
-				rf.mu.Unlock()
-				break
-			}
-
-			// 更新快照日志
-			lastSnapshotLog := rf.GetLog(int32(msg.SnapshotIndex)) //GetLog和lastIncludeIndex存在依赖
-			tailLogs := make([]LogEntry, 0)
-			for i := msg.SnapshotIndex + 1; i < int(rf.GetLength()); i++ {
-				tailLogs = append(tailLogs, rf.GetLog(int32(i)))
-			}
-
-			rf.lastIncludeIndex = int32(msg.SnapshotIndex)
-			rf.lastIncludeTerm = lastSnapshotLog.Term
-			rf.logs = tailLogs
-
-			if int32(msg.SnapshotIndex) > rf.commitIndex {
-				rf.commitIndex = int32(msg.SnapshotIndex)
-			}
-			if int32(msg.SnapshotIndex) > rf.lastApplied {
-				rf.lastApplied = int32(msg.SnapshotIndex)
-			}
-			rf.persist()
-			rf.persister.SaveSnapshot(msg.Snapshot)
-
+			rf.DebugPrint("InstallSnapshot applying, SnapshotIndex = %v SnapshotTerm = %v", msg.SnapshotIndex, msg.SnapshotTerm)
 			rf.mu.Unlock()
+			rf.applyCh <- msg
 
+			rf.mu.Lock()
+			rf.snapshotCount-- //保证快照应用的原子性
+			rf.mu.Unlock()
 		}
 	}
 	// for rf.commitIndex > rf.lastApplied {
@@ -510,6 +517,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	} else if rf.currentTerm < args.Term {
 		//change to follower
+		if rf.state == Leader { // leader 不具备选举超时，在更换状态时，需开启选举超时
+			rf.electTimer.Reset(RandomTimeout())
+		}
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1 //变成Follower重新拥有一次投票权
@@ -534,18 +544,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
-	// if (rf.votedFor == -1 || rf.votedFor == int32(args.CandidateId)) &&
-	// 	(rf.logs[len(rf.logs)-1].Term < args.LastLogTerm || rf.logs[len(rf.logs)-1].Term == args.LastLogTerm && (len(rf.logs)-1) <= int(args.LastLogIndex)) {
-	// 	rf.votedFor = int32(args.CandidateId)
-	// 	rf.persist()
-
-	// 	// fmt.Printf("%v vote to %v at %v\n", rf.me, args.CandidateId, reply.Term)
-
-	// 	rf.DebugPrint("me vote to %v", args.CandidateId)
-	// 	reply.VoteGranted = true
-	// } else {
-	// 	reply.VoteGranted = false
-	// }
 }
 
 type InstallSnapshotArgs struct {
@@ -560,7 +558,7 @@ type InstallSnapshotReply struct {
 	Term int32
 }
 
-//和Snapshot函数差不多
+// 和Snapshot函数差不多
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -568,6 +566,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Term = rf.currentTerm
 		return
 	} else if args.Term > rf.currentTerm {
+		if rf.state == Leader { // leader 不具备选举超时，在更换状态时，需开启选举超时
+			rf.electTimer.Reset(RandomTimeout())
+		}
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = args.LeaderId // rf.votedFor = -1 //变成Follower重新拥有一次投票权
@@ -578,11 +579,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	reply.Term = rf.currentTerm
-
+	// if args.LastIncludeIndex <= rf.commitIndex {
+	// 	return
+	// }
 	if args.LastIncludeIndex <= rf.lastIncludeIndex {
 		return
 	}
-	// 保留一致的log entries
+	//保留一致的log entries
 	tailLogs := make([]LogEntry, 0)
 	if args.LastIncludeIndex < rf.GetLength() && args.LastIncludeTerm == rf.GetLog(args.LastIncludeIndex).Term {
 		for i := args.LastIncludeIndex + 1; i < rf.GetLength(); i++ {
@@ -597,10 +600,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.commitIndex < args.LastIncludeIndex { // is need?
 		rf.commitIndex = args.LastIncludeIndex
 	}
-	if rf.lastApplied < args.LastIncludeIndex {
+	// if rf.lastApplied < args.LastIncludeIndex {
 
-		rf.lastApplied = args.LastIncludeIndex
-	}
+	// 	rf.lastApplied = args.LastIncludeIndex
+	// }
+
+	rf.lastApplied = args.LastIncludeIndex //无条件更改
+
 	//持久化状态和快照
 	rf.persist()
 	rf.persister.SaveSnapshot(args.Data)
@@ -609,21 +615,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		args.LeaderId,
 		args.LastIncludeIndex,
 		args.LastIncludeTerm)
+
+	rf.snapshotCount++ //保证快照应用的原子性
+	rf.mu.Unlock()
 	//应用快照
-	msg := ApplyMsg{
+	rf.wakeupSnapshot <- ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
 		SnapshotTerm:  int(args.LastIncludeTerm),
 		SnapshotIndex: int(args.LastIncludeIndex),
 	}
 
-	// rf.toApply = false
-	// go func() { //异步应用
-	// 	rf.applyCh <- msg
-	// 	rf.toApply = true
-	// }()
-	rf.applyCh <- msg
-	// rf.wakeupSnapshot <- msg
+	rf.mu.Lock()
 	return
 }
 
@@ -761,6 +764,9 @@ func (rf *Raft) StartElection(timeout time.Duration) {
 			}
 			if rf.currentTerm < reqVoteReply.Term { //出现新任期，（新Leader
 				//change to follower
+				if rf.state == Leader { // leader 不具备选举超时，在更换状态时，需开启选举超时
+					rf.electTimer.Reset(RandomTimeout())
+				}
 				rf.currentTerm = reqVoteReply.Term
 				rf.state = Follower
 				rf.votedFor = -1 //变成Follower重新拥有一次投票权
@@ -815,6 +821,7 @@ func (rf *Raft) StartAppendEntries(command interface{}) (int, bool, int) {
 				CommandValid: true,
 				Command:      command,
 				CommandIndex: int(rf.GetLength()),
+				CommandTerm:  rf.currentTerm,
 			},
 			Term: rf.currentTerm,
 		})
@@ -849,8 +856,8 @@ func (rf *Raft) StartAppendEntries(command interface{}) (int, bool, int) {
 					rf.mu.Unlock()
 					ok := rf.sendInstallSnapShot(id, &reqInstallSnapshotArgs, &reqInstallSnapshotReply)
 					if ok != true {
-						rf.DebugPrint("id=%v is crash!!", id)
 						rf.mu.Lock()
+						rf.DebugPrint("id=%v is crash!!", id)
 						return
 					}
 
@@ -861,6 +868,9 @@ func (rf *Raft) StartAppendEntries(command interface{}) (int, bool, int) {
 
 					if rf.currentTerm < reqInstallSnapshotReply.Term { //出现新任期，（新Leader
 						//change to follower
+						if rf.state == Leader { // leader 不具备选举超时，在更换状态时，需开启选举超时
+							rf.electTimer.Reset(RandomTimeout())
+						}
 						rf.currentTerm = reqInstallSnapshotReply.Term
 						rf.state = Follower
 						rf.votedFor = -1 //变成Follower重新拥有一次投票权
@@ -894,8 +904,8 @@ func (rf *Raft) StartAppendEntries(command interface{}) (int, bool, int) {
 					rf.mu.Unlock()
 					ok := rf.sendRequestAppendEntries(id, &reqAppendEntriesArgs, &reqAppendEntriesReply)
 					if ok != true {
-						rf.DebugPrint("id=%v is crash!!", id)
 						rf.mu.Lock()
+						rf.DebugPrint("id=%v is crash!!", id)
 						return
 					}
 					rf.mu.Lock()
@@ -910,6 +920,9 @@ func (rf *Raft) StartAppendEntries(command interface{}) (int, bool, int) {
 						}
 						//rf.DebugPrint("id=%v is change to follower", id)
 						//change to follower
+						if rf.state == Leader { // leader 不具备选举超时，在更换状态时，需开启选举超时
+							rf.electTimer.Reset(RandomTimeout())
+						}
 						rf.currentTerm = reqAppendEntriesReply.Term
 						rf.state = Follower
 						rf.votedFor = -1 //变成Follower重新拥有一次投票权
@@ -974,10 +987,16 @@ func (rf *Raft) StartAppendEntries(command interface{}) (int, bool, int) {
 				if count > len(rf.peers)/2 {
 					rf.commitIndex = N
 					// rf.ApplyToStateMachine()
-					rf.wakeupApply <- rf.commitIndex
+					// rf.wakeupApply <- rf.commitIndex
+					select {
+					case rf.wakeupApply <- rf.commitIndex:
+					default:
+					}
 					rf.DebugPrint("--------------commit=%v", rf.commitIndex)
 				}
 			}
+
+			return
 		}(i)
 	}
 
@@ -1005,6 +1024,7 @@ func (rf *Raft) EventHandle() { //被动触发
 			case Leader:
 				fmt.Printf("Leader cannot ElectTimeOut!\n")
 				rf.electTimer.Stop()
+				rf.mu.Unlock()
 			default:
 				log.Fatalf("rf.state == %v error state!\n", rf.state)
 			}
@@ -1042,6 +1062,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		lastApplied:      0,
 		nextIndex:        make([]int32, len(peers)),
 		matchIndex:       make([]int32, len(peers)),
+		snapshotCount:    0,
 	}
 	rf.peers = peers
 	rf.persister = persister

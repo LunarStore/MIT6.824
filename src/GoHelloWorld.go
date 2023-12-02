@@ -174,14 +174,37 @@ func ArrayTest() { //浅复制
 
 	arCp[0] = 9
 	fmt.Printf("<%p>:%v---<%p>:%v\n", &ar, ar[0], &arCp, arCp[0])
+
+	arrnil := []int{}
+	arrnum := []int{1, 2, 3}
+
+	arrnil = arrnum
+
+	arrnil[0] = 9
+	fmt.Printf("<%p>:%v---<%p>:%v\n", &arrnil[0], arrnil, &arrnum[0], arrnum)
 }
 
 func SliceTest() {
 	arr := []int{1, 2}
 	fmt.Printf("%v, %v\n", arr[2:], nil)
-	fmt.Printf("%v, %v\n", arr[1:0], nil)
+	// fmt.Printf("%v, %v\n", arr[1:0], nil)
 }
 
+func DeferTest() {
+	defer fmt.Printf("okok\n")
+
+}
+
+func ChanTest() {
+	ch := make(chan int, 1)
+	ch <- 1
+	select {
+	case ch <- 2:
+	default:
+		fmt.Printf("out\n")
+	}
+
+}
 func main() {
 	var v int
 	var ptr *MyClass
@@ -209,6 +232,8 @@ func main() {
 	// SelectTest()
 	// ChannelTest()
 	// TimerTest()
-	// ArrayTest()
+	ArrayTest()
 	// SliceTest()
+	// DeferTest()
+	// ChanTest()
 }

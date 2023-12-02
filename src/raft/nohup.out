@@ -872,3 +872,9 @@
 ./FindError.sh: line 15: counter: command not found
 ./FindError.sh: line 15: counter: command not found
 ./FindError.sh: line 22: counter+1: command not found
+1
+./FindError.sh: line 19: ${(cat ./DEBUG.txt | grep -e FAIL | wc -l)}: bad substitution
+./FindError.sh: line 19: ${(cat ./DEBUG.txt | grep -e FAIL | wc -l)}: bad substitution
+./DEBUG1.txt
+./DEBUG1.txt
+./DEBUG1.txt
