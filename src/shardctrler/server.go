@@ -468,7 +468,7 @@ func (sc *ShardCtrler) ReadPersist(snapshot []byte) {
 		return
 	}
 
-	r := bytes.NewBuffer(sc.rf.ReadSnapshot())
+	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
 	var data []Config
@@ -527,6 +527,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.lastResults = make(map[int64]Result)
 	sc.notifyChan = make(map[int64]chan Result)
 
+	sc.ReadPersist(sc.rf.ReadSnapshot()) //读取被持久化的数据
+
 	labgob.Register(JoinArgs{})
 	labgob.Register(LeaveArgs{})
 	labgob.Register(MoveArgs{})
@@ -537,6 +539,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(MoveReply{})
 	labgob.Register(QueryReply{})
 	go sc.Applier()
+
 	return sc
 }
 

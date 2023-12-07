@@ -18,6 +18,20 @@ const (
 
 type Err string
 
+type CommandArgs struct {
+	ClientId       int64
+	SequenceNumber int64
+	OpType         string
+	Args           interface{}
+}
+
+type CommandReply struct {
+	Err    Err
+	OpType string
+
+	Reply interface{}
+}
+
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
@@ -27,6 +41,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
 }
 
 type PutAppendReply struct {
