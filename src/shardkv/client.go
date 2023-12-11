@@ -108,7 +108,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := CommandArgs{
 		ClientId:       ck.clientId,
 		SequenceNumber: ck.sequenceNumber,
-		OpType:         op,
+		OpType:         "PutAppend",
 		Args: PutAppendArgs{
 			Key:   key,
 			Value: value,

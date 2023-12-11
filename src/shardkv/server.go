@@ -1,9 +1,11 @@
 package shardkv
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -37,7 +39,7 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-
+	scck        *shardctrler.Clerk
 	lastApplied int
 	lastResults map[int64]Result      //key：ClientId，value：result
 	notifyChan  map[int64]chan Result //key：commandIndex，value：result
@@ -46,8 +48,15 @@ type ShardKV struct {
 	//shard
 	lastConfig shardctrler.Config
 	curConfig  shardctrler.Config
-	shards     [shardctrler.NShards]Shard
+	shards     [shardctrler.NShards]Shard //定长数值，拷贝会自动深拷贝、而变长的·切片数组则是浅拷贝。
 }
+
+// OpType
+const (
+	Get          = "Get"
+	PutAppend    = "PutAppend"
+	UpdateConfig = "UpdateConfig"
+)
 
 /*
 Server		//分片可以读写
@@ -56,6 +65,14 @@ Wait(Stop)	//分片等待从被拉取的group中删除（保持原子性）
 Erase		//分片等待被拉取后，删除
 Invalid		//分片无效
 */
+const (
+	Server = iota
+	Pulling
+	Wait
+	Erase
+	Invalid
+)
+
 type Shard struct {
 	id           int32
 	state        int32
@@ -89,6 +106,13 @@ func (kv *ShardKV) GetNotifyChan(commandIndex int64, autoCreate bool) chan Resul
 	}
 
 	return ch
+}
+
+func (kv *ShardKV) RemoveNotifyChan(commandIndex int64) {
+	if _, ok := kv.notifyChan[commandIndex]; ok == true {
+		//找到，删除返回
+		delete(kv.notifyChan, commandIndex)
+	}
 }
 
 //内存kv状态机
@@ -154,7 +178,44 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 }
 
 func (kv *ShardKV) CommandHanler(args *CommandArgs, reply *CommandReply) {
+	// Your code here.
+	//判断操作是否冗余，冗余字节返回，否则，应用到状态机
+	DPrintf("begin CommandHanler()")
+	defer DPrintf("end CommandHanler()")
+	kv.mu.Lock()
+	if kv.IsDuplicateRequest(args.ClientId, args.SequenceNumber) {
+		*reply = kv.lastResults[args.ClientId].CommandReply
+		//DPrintf("kv.PutAppend,IsDuplicateRequest == true Err = %v\n", reply.Err)
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	DPrintf("sc.CommandHanler,begin start args = %v\n", args)
+	index, _, isLeader := kv.rf.Start(Command(*args))
+	DPrintf("sc.CommandHanler,end start isLeader = %v\n", isLeader)
+	if isLeader != true {
+		//不是leader
+		reply.Err = ErrWrongLeader
+		reply.OpType = args.OpType
+		return
+	}
 
+	var ch chan Result = nil
+	kv.mu.Lock()
+	ch = kv.GetNotifyChan(int64(index), true)
+	kv.mu.Unlock()
+
+	select {
+	case res := <-ch:
+		*reply = res.CommandReply
+	case <-time.After(time.Millisecond * 500): // 超时返回
+		reply.Err = ErrTimeout
+		reply.OpType = args.OpType
+	}
+	kv.mu.Lock()
+	kv.RemoveNotifyChan(int64(index))
+	kv.mu.Unlock()
+	return
 }
 
 func (kv *ShardKV) Applier() {
@@ -193,13 +254,37 @@ func (kv *ShardKV) CommandApply(msg raft.ApplyMsg) {
 		res = kv.lastResults[cmd.ClientId]
 	} else {
 		//对命令进行处理
-		switch cmd.OpType { // 防止sequence number 回溯！
+		switch cmd.OpType {
+		case Get:
+			args := cmd.Args.(GetArgs)
+			reply := GetReply{}
+			kv.GetCommand(&args, &reply)
+			res.CommandReply = CommandReply{
+				Err:    reply.Err,
+				OpType: cmd.OpType,
+				Reply:  reply,
+			}
+
+			res.SequenceNumber = cmd.SequenceNumber
+			kv.lastResults[cmd.ClientId] = res
+		case PutAppend:
+			args := cmd.Args.(PutAppendArgs)
+			reply := PutAppendReply{}
+			kv.PutAppendCommand(&args, &reply)
+			res.CommandReply = CommandReply{
+				Err:    reply.Err,
+				OpType: cmd.OpType,
+				Reply:  reply,
+			}
+
+			res.SequenceNumber = cmd.SequenceNumber
+			kv.lastResults[cmd.ClientId] = res
+		case UpdateConfig:
+			args := cmd.Args.(shardctrler.Config)
+			kv.UpdateConfigCommand(&args)
 		default:
 			log.Fatalf("not exist opType!<%v>\n", msg.Command)
 		}
-
-		res.SequenceNumber = cmd.SequenceNumber
-		kv.lastResults[cmd.ClientId] = res
 	}
 	//_, isLeader := kv.rf.GetState()
 	//明确，不是所有的命令都是由client发送的。也即不是所有命令在达成共识后，leader就要唤醒请求rpc。
@@ -220,19 +305,149 @@ func (kv *ShardKV) CommandApply(msg raft.ApplyMsg) {
 
 	return
 }
+func (kv *ShardKV) GetCommand(args *GetArgs, reply *GetReply) {
+	shard := key2shard(args.Key)
+	if kv.curConfig.Shards[shard] == kv.gid { //是在本集群组
+		if kv.shards[shard].state == Server {
+			reply.Value, reply.Err = kv.shards[shard].stateMachine.Get(args.Key)
+		} else { //没准备好
+			reply.Err = NoReady
+		}
+	} else {
+		reply.Err = ErrWrongGroup
+	}
+}
+
+func (kv *ShardKV) PutAppendCommand(args *PutAppendArgs, reply *PutAppendReply) {
+	shard := key2shard(args.Key)
+	if kv.curConfig.Shards[shard] == kv.gid { //是在本集群组
+		if kv.shards[shard].state == Server {
+			switch args.Op {
+			case "Put":
+				reply.Err = kv.shards[shard].stateMachine.Put(args.Key, args.Value)
+			case "Append":
+				reply.Err = kv.shards[shard].stateMachine.Append(args.Key, args.Value)
+			default:
+				log.Fatalf("in PutAppendCommand not exist opType!<%v>\n", args.Op)
+			}
+
+		} else { //没准备好
+			reply.Err = NoReady
+		}
+	} else {
+		reply.Err = ErrWrongGroup
+	}
+}
+
+func (kv *ShardKV) UpdateConfigCommand(cfg *shardctrler.Config) {
+	if cfg.Num <= kv.curConfig.Num {
+		return
+	}
+	kv.lastConfig = kv.curConfig
+	kv.curConfig = *cfg
+	for shard, db := range kv.shards {
+		// 对比cfg 和 curConfig哪些该删除，哪些该pull数据
+		if kv.curConfig.Shards[shard] == kv.gid {
+			//新配置中该分片是该组，可能需要迁移、可能不需要
+			if kv.lastConfig.Shards[shard] == kv.gid {
+				//不变、无需迁移
+			} else {
+				// db.state == Invalid
+				db.state = Pulling
+			}
+		} else { //新配置不为该分片服务
+			if kv.lastConfig.Shards[shard] == kv.gid {
+				//旧配置为该分片服务
+				db.state = Erase
+			} else {
+
+			}
+		}
+	}
+}
 
 func (kv *ShardKV) SnapshotApply(msg raft.ApplyMsg) {
 	//应用leader发来的快照
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if msg.SnapshotIndex <= kv.lastApplied {
+		return
+	}
+	kv.ReadPersist(msg.Snapshot)
+
+	return
 }
 
 func (kv *ShardKV) MakeSnapshot() {
 	//make快照并调用raft达成共识。
+	DPrintf("kv.Applier start make snapshot, index = %v\n", kv.lastApplied)
 
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.shards) // data
+	e.Encode(kv.curConfig)
+	e.Encode(kv.lastConfig)
+	e.Encode(kv.lastResults) //客户最后一次应用记实录，为了去重
+	e.Encode(kv.lastApplied)
+
+	kv.rf.Snapshot(kv.lastApplied, w.Bytes())
+}
+
+func (kv *ShardKV) ReadPersist(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&kv.shards) != nil ||
+		d.Decode(&kv.curConfig) != nil ||
+		d.Decode(&kv.lastConfig) != nil ||
+		d.Decode(&kv.lastResults) != nil ||
+		d.Decode(&kv.lastApplied) != nil {
+		log.Fatalf("data Decode fail!<%v>\n", r)
+	} else {
+	}
+}
+
+func (kv *ShardKV) BackGroundWork(task func()) {
+	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			task()
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // 配置拉取协程
 func (kv *ShardKV) PullConfig() {
 	//make快照并调用raft达成共识。
+	needToUpdate := true
+	kv.mu.Lock()
+	curCfgNum := kv.curConfig.Num
+	for _, db := range kv.shards {
+		if db.state != Server && db.state != Invalid {
+			needToUpdate = false
+			break
+		}
+	}
+	kv.mu.Unlock()
+
+	if needToUpdate == true {
+		cfg := kv.scck.Query(-1) //查询最新的配置
+
+		if cfg.Num > curCfgNum {
+			//通过raft达成共识
+			kv.rf.Start(CommandArgs{
+				ClientId:       -1,
+				SequenceNumber: -1,
+				OpType:         UpdateConfig,
+				Args:           cfg,
+			})
+		}
+	}
 
 }
 
@@ -310,17 +525,22 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.dead = 0
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.scck = shardctrler.MakeClerk(ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	//shards 没有初始化
+	kv.curConfig.Groups = make(map[int][]string)
+	kv.lastConfig.Groups = make(map[int][]string)
+	for i, _ := range kv.shards {
+		kv.shards[i].id = int32(i)
+		kv.shards[i].state = Invalid
+		kv.shards[i].stateMachine = NewMemoryKV()
+	}
+	//读取持久化数据
+
+	kv.ReadPersist(persister.ReadSnapshot())
 	//后台协程没有启动
 	return kv
 }
-
-// stateMachine KVStateMachine
-// lastApplied  int
-// lastResults  map[int64]Result      //key：ClientId，value：result
-// notifyChan   map[int64]chan Result //key：commandIndex，value：result
-// dead         int32
