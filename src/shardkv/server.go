@@ -3,6 +3,7 @@ package shardkv
 import (
 	"bytes"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +56,11 @@ type ShardKV struct {
 const (
 	Get          = "Get"
 	PutAppend    = "PutAppend"
-	UpdateConfig = "UpdateConfig"
+	UpdateConfig = "UpdateConfig" //本端执行
+	PullShard    = "PullShard"    //req对端执行
+	InstallShard = "InstallShard" //本端执行
+	EraseShard   = "EraseShard"   //req对端执行
+	ServerShard  = "ServerShard"  //本端执行让shard的开始server
 )
 
 /*
@@ -74,9 +79,9 @@ const (
 )
 
 type Shard struct {
-	id           int32
-	state        int32
-	stateMachine KVStateMachine
+	Id           int32
+	State        int32
+	StateMachine KVStateMachine
 }
 type Command = CommandArgs
 
@@ -86,6 +91,9 @@ type Result struct {
 }
 
 func (kv *ShardKV) IsDuplicateRequest(clientId int64, sequenceNumber int64) bool {
+	if clientId == -1 {
+		return false
+	}
 	if res, ok := kv.lastResults[clientId]; ok && res.SequenceNumber >= sequenceNumber {
 		return true
 	}
@@ -180,19 +188,40 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) CommandHanler(args *CommandArgs, reply *CommandReply) {
 	// Your code here.
 	//判断操作是否冗余，冗余字节返回，否则，应用到状态机
-	DPrintf("begin CommandHanler()")
-	defer DPrintf("end CommandHanler()")
+	// DPrintf("begin CommandHanler() args = %v", args)
+	// defer DPrintf("end CommandHanler() reply = %v", reply)
 	kv.mu.Lock()
-	if kv.IsDuplicateRequest(args.ClientId, args.SequenceNumber) {
+	if args.OpType == Get || args.OpType == PutAppend {
+		var shard int
+		switch args.OpType {
+		case Get:
+			shard = key2shard(args.Args.(GetArgs).Key)
+		case PutAppend:
+			shard = key2shard(args.Args.(PutAppendArgs).Key)
+		}
+		if kv.curConfig.Shards[shard] != kv.gid {
+			kv.mu.Unlock()
+			reply.Err = ErrWrongGroup
+			reply.OpType = args.OpType
+			return
+		}
+	}
+	if args.OpType != Get && kv.IsDuplicateRequest(args.ClientId, args.SequenceNumber) {
 		*reply = kv.lastResults[args.ClientId].CommandReply
 		//DPrintf("kv.PutAppend,IsDuplicateRequest == true Err = %v\n", reply.Err)
 		kv.mu.Unlock()
+		// if args.OpType != reply.OpType {
+		// 	//log.Fatalf("args<%v>but reply<%v>", args, reply)
+		// 	reply.Err = Retry
+		// 	reply.OpType = args.OpType
+		// }
 		return
 	}
 	kv.mu.Unlock()
-	DPrintf("sc.CommandHanler,begin start args = %v\n", args)
+
+	//DPrintf("sc.CommandHanler,begin start args = %v\n", args)
 	index, _, isLeader := kv.rf.Start(Command(*args))
-	DPrintf("sc.CommandHanler,end start isLeader = %v\n", isLeader)
+	//DPrintf("sc.CommandHanler,end start isLeader = %v\n", isLeader)
 	if isLeader != true {
 		//不是leader
 		reply.Err = ErrWrongLeader
@@ -215,6 +244,12 @@ func (kv *ShardKV) CommandHanler(args *CommandArgs, reply *CommandReply) {
 	kv.mu.Lock()
 	kv.RemoveNotifyChan(int64(index))
 	kv.mu.Unlock()
+
+	// if args.OpType != reply.OpType {
+	// 	//log.Fatalf("args<%v>but reply<%v>", args, reply)
+	// 	reply.Err = Retry
+	// 	reply.OpType = args.OpType
+	// }
 	return
 }
 
@@ -223,7 +258,7 @@ func (kv *ShardKV) Applier() {
 	for kv.killed() == false {
 		select {
 		case msg := <-kv.applyCh:
-			DPrintf("begin =================%v\n", msg)
+
 			if msg.CommandValid {
 				kv.CommandApply(msg)
 			} else if msg.SnapshotValid { //被动触发的快照
@@ -232,7 +267,6 @@ func (kv *ShardKV) Applier() {
 				log.Fatalf("invalid msg<%v>\n", msg)
 			}
 
-			DPrintf("end =================%v\n", msg)
 		}
 	}
 
@@ -249,7 +283,7 @@ func (kv *ShardKV) CommandApply(msg raft.ApplyMsg) {
 		// log.Fatalf("except command index, want to get %v, but got %v", kv.lastApplied+1, msg.CommandIndex)
 		DPrintf("except command index, want to get %v, but got %v", kv.lastApplied+1, msg.CommandIndex)
 		return
-	} else if kv.IsDuplicateRequest(cmd.ClientId, cmd.SequenceNumber) {
+	} else if cmd.OpType != Get && kv.IsDuplicateRequest(cmd.ClientId, cmd.SequenceNumber) {
 		//命令重复
 		res = kv.lastResults[cmd.ClientId]
 	} else {
@@ -266,7 +300,7 @@ func (kv *ShardKV) CommandApply(msg raft.ApplyMsg) {
 			}
 
 			res.SequenceNumber = cmd.SequenceNumber
-			kv.lastResults[cmd.ClientId] = res
+			// kv.lastResults[cmd.ClientId] = res
 		case PutAppend:
 			args := cmd.Args.(PutAppendArgs)
 			reply := PutAppendReply{}
@@ -282,6 +316,15 @@ func (kv *ShardKV) CommandApply(msg raft.ApplyMsg) {
 		case UpdateConfig:
 			args := cmd.Args.(shardctrler.Config)
 			kv.UpdateConfigCommand(&args)
+		case InstallShard:
+			args := cmd.Args.(ShardReply)
+			kv.InstallShardCommand(&args)
+		case EraseShard:
+			kv.EraseShardCommand(&cmd, &res.CommandReply)
+			res.SequenceNumber = -1
+		case ServerShard:
+			kv.ServerShardCommand(&cmd)
+			res.SequenceNumber = -1
 		default:
 			log.Fatalf("not exist opType!<%v>\n", msg.Command)
 		}
@@ -308,10 +351,13 @@ func (kv *ShardKV) CommandApply(msg raft.ApplyMsg) {
 func (kv *ShardKV) GetCommand(args *GetArgs, reply *GetReply) {
 	shard := key2shard(args.Key)
 	if kv.curConfig.Shards[shard] == kv.gid { //是在本集群组
-		if kv.shards[shard].state == Server {
-			reply.Value, reply.Err = kv.shards[shard].stateMachine.Get(args.Key)
+		if kv.shards[shard].State == Server {
+			reply.Value, reply.Err = kv.shards[shard].StateMachine.Get(args.Key)
 		} else { //没准备好
 			reply.Err = NoReady
+			if kv.shards[shard].State == Invalid {
+				log.Fatalf("[gid = %v] GetCommand.NoReady state = %v \t lastCfg = %v \t curCfg = %v", kv.gid, kv.StateToString(), kv.lastConfig, kv.curConfig)
+			}
 		}
 	} else {
 		reply.Err = ErrWrongGroup
@@ -321,49 +367,147 @@ func (kv *ShardKV) GetCommand(args *GetArgs, reply *GetReply) {
 func (kv *ShardKV) PutAppendCommand(args *PutAppendArgs, reply *PutAppendReply) {
 	shard := key2shard(args.Key)
 	if kv.curConfig.Shards[shard] == kv.gid { //是在本集群组
-		if kv.shards[shard].state == Server {
+		if kv.shards[shard].State == Server {
 			switch args.Op {
 			case "Put":
-				reply.Err = kv.shards[shard].stateMachine.Put(args.Key, args.Value)
+				reply.Err = kv.shards[shard].StateMachine.Put(args.Key, args.Value)
 			case "Append":
-				reply.Err = kv.shards[shard].stateMachine.Append(args.Key, args.Value)
+				reply.Err = kv.shards[shard].StateMachine.Append(args.Key, args.Value)
 			default:
 				log.Fatalf("in PutAppendCommand not exist opType!<%v>\n", args.Op)
 			}
-
+			DPrintf("PutAppendCommand : <%v>", args)
 		} else { //没准备好
 			reply.Err = NoReady
+			if kv.shards[shard].State == Invalid {
+				log.Fatalf("[gid = %v] GetCommand.NoReady state = %v \t lastCfg = %v \t curCfg = %v", kv.gid, kv.StateToString(), kv.lastConfig, kv.curConfig)
+			}
 		}
 	} else {
 		reply.Err = ErrWrongGroup
 	}
 }
 
+// const (
+//
+//	Server = iota
+//	Pulling
+//	Wait
+//	Erase
+//	Invalid
+//
+// )
+func StateToStringHelp(state int) string {
+	switch state {
+	case Server:
+		return "Server"
+	case Pulling:
+		return "Pulling"
+	case Wait:
+		return "Wait"
+	case Erase:
+		return "Erase"
+	case Invalid:
+		return "Invalid"
+	default:
+		return "Unknow"
+	}
+}
+func (kv *ShardKV) StateToString() string {
+	res := ""
+	for shard, db := range kv.shards {
+		res += (StateToStringHelp(int(db.State)) + "[" + strconv.Itoa(shard) + "]" + ",")
+	}
+
+	return res
+}
 func (kv *ShardKV) UpdateConfigCommand(cfg *shardctrler.Config) {
 	if cfg.Num <= kv.curConfig.Num {
 		return
 	}
 	kv.lastConfig = kv.curConfig
 	kv.curConfig = *cfg
-	for shard, db := range kv.shards {
-		// 对比cfg 和 curConfig哪些该删除，哪些该pull数据
-		if kv.curConfig.Shards[shard] == kv.gid {
-			//新配置中该分片是该组，可能需要迁移、可能不需要
-			if kv.lastConfig.Shards[shard] == kv.gid {
-				//不变、无需迁移
+	DPrintf("group = %v execute UpdateConfigCommand begin <%v>", kv.gid, kv.curConfig)
+	if kv.lastConfig.Num == 0 {
+		for shard, _ := range kv.shards {
+			if kv.curConfig.Shards[shard] == kv.gid {
+				kv.shards[shard].State = Server
+				kv.shards[shard].StateMachine = NewMemoryKV()
 			} else {
-				// db.state == Invalid
-				db.state = Pulling
+				kv.shards[shard].State = Invalid
 			}
-		} else { //新配置不为该分片服务
-			if kv.lastConfig.Shards[shard] == kv.gid {
-				//旧配置为该分片服务
-				db.state = Erase
-			} else {
+		}
+	} else {
+		for shard, _ := range kv.shards {
+			// 对比cfg 和 curConfig哪些该删除，哪些该pull数据
+			if kv.curConfig.Shards[shard] == kv.gid {
+				//新配置中该分片是该组，可能需要迁移、可能不需要
+				if kv.lastConfig.Shards[shard] == kv.gid {
+					//不变、无需迁移
+				} else {
+					// db.state == Invalid
+					kv.shards[shard].State = Pulling
+				}
+			} else { //新配置不为该分片服务
+				if kv.lastConfig.Shards[shard] == kv.gid {
+					//旧配置为该分片服务
+					kv.shards[shard].State = Erase
+				} else {
 
+				}
 			}
 		}
 	}
+
+	DPrintf("group = %v execute UpdateConfigCommand end <shard state:%v>", kv.gid, kv.StateToString())
+
+}
+
+func (kv *ShardKV) InstallShardCommand(sr *ShardReply) {
+	if sr.ConfigNum < kv.curConfig.Num {
+		return //过期的冗余命令
+	}
+
+	if kv.shards[sr.Shard].State != Pulling {
+		log.Fatalf("error shard state <%v>", kv.shards[sr.Shard].State)
+	}
+	DPrintf("gid = %v get shard", kv.gid)
+	kv.shards[sr.Shard].StateMachine = NewMemoryKV()
+	kv.shards[sr.Shard].StateMachine.SetData(CopyKVMap(sr.DB.GetData()))
+	kv.shards[sr.Shard].State = Wait
+}
+
+func (kv *ShardKV) EraseShardCommand(args *CommandArgs, reply *CommandReply) {
+	if args.Args.(ShardArgs).ConfigNum < kv.curConfig.Num {
+		// log.Fatalf("your config number is old too")
+		reply.Err = Retry
+		reply.OpType = args.OpType
+		reply.Reply = nil
+		return
+	}
+	if kv.shards[args.Args.(ShardArgs).Shard].State != Erase {
+		DPrintf("my shards[%v] is already deleted!", args.Args.(ShardArgs).Shard)
+		reply.Err = DumpOpt
+		reply.OpType = args.OpType
+		reply.Reply = nil
+		return
+	}
+	kv.shards[args.Args.(ShardArgs).Shard].State = Invalid
+	kv.shards[args.Args.(ShardArgs).Shard].StateMachine = nil
+
+	reply.Err = OK
+	reply.OpType = args.OpType
+	reply.Reply = nil
+}
+
+func (kv *ShardKV) ServerShardCommand(args *CommandArgs) {
+	if args.Args.(ShardArgs).ConfigNum < kv.curConfig.Num {
+		log.Fatalf("args config number is old too")
+	}
+	if kv.shards[args.Args.(ShardArgs).Shard].State != Wait {
+		log.Fatalf("my shards[%v].state is not Wait, state is %v", args.Args.(ShardArgs).Shard, StateToStringHelp(int(kv.shards[args.Args.(ShardArgs).Shard].State)))
+	}
+	kv.shards[args.Args.(ShardArgs).Shard].State = Server
 }
 
 func (kv *ShardKV) SnapshotApply(msg raft.ApplyMsg) {
@@ -387,7 +531,7 @@ func (kv *ShardKV) MakeSnapshot() {
 	e.Encode(kv.shards) // data
 	e.Encode(kv.curConfig)
 	e.Encode(kv.lastConfig)
-	e.Encode(kv.lastResults) //客户最后一次应用记实录，为了去重
+	e.Encode(kv.lastResults) //客户最后一次应用记录，为了去重
 	e.Encode(kv.lastApplied)
 
 	kv.rf.Snapshot(kv.lastApplied, w.Bytes())
@@ -427,8 +571,8 @@ func (kv *ShardKV) PullConfig() {
 	needToUpdate := true
 	kv.mu.Lock()
 	curCfgNum := kv.curConfig.Num
-	for _, db := range kv.shards {
-		if db.state != Server && db.state != Invalid {
+	for shard, _ := range kv.shards {
+		if kv.shards[shard].State != Server && kv.shards[shard].State != Invalid {
 			needToUpdate = false
 			break
 		}
@@ -439,6 +583,7 @@ func (kv *ShardKV) PullConfig() {
 		cfg := kv.scck.Query(-1) //查询最新的配置
 
 		if cfg.Num > curCfgNum {
+			DPrintf("need to update config <begin><%v>", cfg)
 			//通过raft达成共识
 			kv.rf.Start(CommandArgs{
 				ClientId:       -1,
@@ -446,22 +591,210 @@ func (kv *ShardKV) PullConfig() {
 				OpType:         UpdateConfig,
 				Args:           cfg,
 			})
+
+			//to do consider to new a chan wait for consistent complete
+			DPrintf("need to update config <end><%v>", cfg)
+		} else {
+			//DPrintf("stable state. the config is newst <curCfgNum = %v>", curCfgNum)
 		}
+	} else {
+		kv.mu.Lock()
+		DPrintf("[gid = %v], temp state.. config <curCfgNum = %v> state = %v", kv.gid, curCfgNum, kv.StateToString())
+		kv.mu.Unlock()
 	}
 
 }
+
+type ShardArgs struct {
+	ConfigNum int
+	Shard     int
+}
+type ShardReply struct {
+	ConfigNum int
+	Shard     int
+	DB        KVStateMachine
+}
+
+func CopyKVMap(originalMap map[string]string) map[string]string {
+	newMap := make(map[string]string)
+	for key, value := range originalMap {
+		newMap[key] = value
+	}
+	return newMap
+}
+func (kv *ShardKV) PullShardHanler(args *CommandArgs, reply *CommandReply) {
+	if args.OpType != PullShard {
+		log.Fatalf("error OpType <%v>", args.OpType)
+	}
+
+	if _, isLeader := kv.rf.GetState(); isLeader == false {
+		reply.Err = ErrWrongLeader
+		reply.OpType = args.OpType
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	//不能删除server状态的shard
+	//如果shard所在的集群配置版本太低，则应该拒绝分片迁移。
+	shard := args.Args.(ShardArgs).Shard
+	if kv.curConfig.Num < args.Args.(ShardArgs).ConfigNum {
+		reply.Err = NoReady
+		reply.OpType = args.OpType
+		return
+	} else if kv.lastConfig.Shards[shard] != kv.gid {
+		log.Fatalf("error PullShard")
+		reply.Err = ErrWrongGroup
+		reply.OpType = args.OpType
+		return
+	} else if kv.shards[shard].State != Erase {
+		log.Fatalf("error PullShard != Erase")
+	}
+
+	//分片迁移
+	reply.Err = OK
+	reply.OpType = args.OpType
+	reply.Reply = ShardReply{
+		ConfigNum: kv.curConfig.Num,
+		Shard:     shard,
+		DB: &MemoryKV{
+			KV: CopyKVMap(kv.shards[shard].StateMachine.GetData()),
+		},
+	}
+
+	return
+}
+
+// type MemoryKV struct {
+// 	KV map[string]string
+// }
 
 // 分片迁移
 // 1、拉取分片
 func (kv *ShardKV) PullShard() {
 	//make快照并调用raft达成共识。
+	kv.mu.Lock()
 
+	wg := sync.WaitGroup{}
+	for shard, _ := range kv.shards {
+		if kv.shards[shard].State == Pulling {
+
+			args := &CommandArgs{
+				ClientId:       -1, //注意CommandHanler需要兼容该项为-1的情况
+				SequenceNumber: -1,
+				OpType:         PullShard,
+				Args: ShardArgs{
+					ConfigNum: kv.curConfig.Num,
+					Shard:     shard,
+				},
+			}
+
+			wg.Add(1)
+			DPrintf("[gid = %v] pull shard[%v] from [%v]", kv.gid, shard, kv.lastConfig.Shards[shard])
+			//rpc拉取
+			go func(args *CommandArgs) {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+				// shard := key2shard(key)
+				gid := kv.lastConfig.Shards[args.Args.(ShardArgs).Shard]
+				if servers, ok := kv.lastConfig.Groups[gid]; ok {
+					// try each server for the shard.
+					kv.mu.Unlock()
+					for si := 0; si < len(servers); si++ {
+						reply := &CommandReply{}
+						srv := kv.make_end(servers[si])
+						ok := srv.Call("ShardKV.PullShardHanler", args, reply)
+						if ok && (reply.Err == OK) {
+							if reply.OpType != PullShard {
+								log.Fatalf("error reply OpType %v", reply.OpType)
+							}
+							DPrintf("[gid = %v] pull shard[%v] from [%v]<%v>", kv.gid, args.Args.(ShardArgs).Shard, kv.lastConfig.Shards[args.Args.(ShardArgs).Shard], reply)
+							kv.rf.Start(CommandArgs{
+								ClientId:       -1,
+								SequenceNumber: -1,
+								OpType:         InstallShard,
+								Args:           reply.Reply, // type is ShardReply
+							})
+							break
+						}
+						if ok && (reply.Err == ErrWrongGroup) {
+							break
+						}
+						// ... not ok, or ErrWrongLeader
+					}
+					kv.mu.Lock()
+				}
+
+				wg.Done()
+			}(args)
+		}
+	}
+
+	kv.mu.Unlock()
+
+	wg.Wait()
 }
 
 // 2、请求对端删除shard
 func (kv *ShardKV) RequestErase() {
 	//make快照并调用raft达成共识。
+	//make快照并调用raft达成共识。
+	kv.mu.Lock()
 
+	wg := sync.WaitGroup{}
+	for shard, _ := range kv.shards {
+		if kv.shards[shard].State == Wait {
+			args := &CommandArgs{
+				ClientId:       -1, //注意CommandHanler需要兼容该项为-1的情况
+				SequenceNumber: -1,
+				OpType:         EraseShard,
+				Args: ShardArgs{
+					ConfigNum: kv.curConfig.Num,
+					Shard:     shard,
+				},
+			}
+
+			wg.Add(1)
+			//rpc拉取
+			go func(args *CommandArgs) {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+				// shard := key2shard(key)
+				gid := kv.lastConfig.Shards[args.Args.(ShardArgs).Shard]
+				if servers, ok := kv.lastConfig.Groups[gid]; ok {
+					kv.mu.Unlock()
+					// try each server for the shard.
+					for si := 0; si < len(servers); si++ {
+						reply := &CommandReply{}
+						srv := kv.make_end(servers[si])
+						ok := srv.Call("ShardKV.CommandHanler", args, reply)
+						if ok && (reply.Err == OK /*|| reply.Err == DumpOpt*/) {
+							if reply.OpType != EraseShard {
+								log.Fatalf("error reply OpType %v", reply.OpType)
+							}
+							kv.rf.Start(CommandArgs{
+								ClientId:       -1,
+								SequenceNumber: -1,
+								OpType:         ServerShard,
+								Args:           args.Args,
+							})
+							break
+						}
+						if ok && (reply.Err == ErrWrongGroup || reply.Err == DumpOpt) {
+							break
+						}
+						// ... not ok, or ErrWrongLeader
+					}
+					kv.mu.Lock()
+				}
+
+				wg.Done()
+			}(args)
+		}
+	}
+
+	kv.mu.Unlock()
+
+	wg.Wait()
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -508,8 +841,21 @@ func (kv *ShardKV) killed() bool {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	// labgob.Register(Op{})
+	labgob.Register(CommandArgs{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(GetArgs{})
 
+	labgob.Register(CommandReply{})
+	labgob.Register(PutAppendReply{})
+	labgob.Register(GetReply{})
+
+	labgob.Register(shardctrler.Config{})
+
+	labgob.Register(ShardArgs{})
+	labgob.Register(ShardReply{})
+	labgob.Register(&MemoryKV{})
+	//labgob.Register(KVStateMachine{})
 	kv := new(ShardKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
@@ -534,13 +880,20 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.curConfig.Groups = make(map[int][]string)
 	kv.lastConfig.Groups = make(map[int][]string)
 	for i, _ := range kv.shards {
-		kv.shards[i].id = int32(i)
-		kv.shards[i].state = Invalid
-		kv.shards[i].stateMachine = NewMemoryKV()
+		kv.shards[i].Id = int32(i)
+		kv.shards[i].State = Invalid
+		kv.shards[i].StateMachine = NewMemoryKV()
 	}
 	//读取持久化数据
 
 	kv.ReadPersist(persister.ReadSnapshot())
+	DPrintf("[gid = %d] state = %v \t lastCfg = %v \t curCfg = %v", kv.gid, kv.StateToString(), kv.lastConfig, kv.curConfig)
 	//后台协程没有启动
+	go kv.Applier()
+	//time.Sleep(100 * time.Millisecond)
+	go kv.BackGroundWork(kv.PullConfig)
+	go kv.BackGroundWork(kv.PullShard)
+	go kv.BackGroundWork(kv.RequestErase)
+
 	return kv
 }

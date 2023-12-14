@@ -86,6 +86,8 @@ func (ck *Clerk) Get(key string) string {
 				var reply CommandReply
 				ok := srv.Call("ShardKV.CommandHanler", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					DPrintf("%v", reply)
+					ck.sequenceNumber++
 					return reply.Reply.(GetReply).Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -125,6 +127,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply CommandReply
 				ok := srv.Call("ShardKV.CommandHanler", &args, &reply)
 				if ok && reply.Err == OK {
+					ck.sequenceNumber++
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {

@@ -6,6 +6,7 @@ package shardctrler
 
 import (
 	"crypto/rand"
+	"log"
 	"math/big"
 	"time"
 
@@ -49,8 +50,12 @@ func (ck *Clerk) Query(num int) Config {
 		for _, srv := range ck.servers {
 			var reply CommandReply
 			ok := srv.Call("ShardCtrler.CommandHanler", &args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.WrongLeader == false && reply.Err == OK {
 				ck.sequenceNumber++
+				if reply.OpType != "Query" || reply.Reply == nil {
+					log.Fatalf("error type <%v>", reply)
+				}
+
 				return reply.Reply.(QueryReply).Config
 			}
 		}
@@ -71,7 +76,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 		for _, srv := range ck.servers {
 			var reply CommandReply
 			ok := srv.Call("ShardCtrler.CommandHanler", &args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.WrongLeader == false && reply.Err == OK {
 				ck.sequenceNumber++
 				return
 			}
@@ -93,7 +98,7 @@ func (ck *Clerk) Leave(gids []int) {
 		for _, srv := range ck.servers {
 			var reply CommandReply
 			ok := srv.Call("ShardCtrler.CommandHanler", &args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.WrongLeader == false && reply.Err == OK {
 				ck.sequenceNumber++
 				return
 			}
@@ -118,7 +123,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 		for _, srv := range ck.servers {
 			var reply CommandReply
 			ok := srv.Call("ShardCtrler.CommandHanler", &args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.WrongLeader == false && reply.Err == OK {
 				ck.sequenceNumber++
 				return
 			}
