@@ -86,7 +86,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply CommandReply
 				ok := srv.Call("ShardKV.CommandHanler", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					DPrintf("%v", reply)
+					// DPrintf("%v", reply)
 					ck.sequenceNumber++
 					return reply.Reply.(GetReply).Value
 				}
