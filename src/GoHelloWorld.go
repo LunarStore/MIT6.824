@@ -205,6 +205,17 @@ func ChanTest() {
 	}
 
 }
+
+func StringTest() {
+	str1 := "123"
+	str2 := "456"
+
+	str1 = str2
+	str1 += "aaa"
+
+	fmt.Printf("str1 : %v\n", str1)
+	fmt.Printf("str2 : %v\n", str2)
+}
 func main() {
 	var v int
 	var ptr *MyClass
@@ -232,8 +243,9 @@ func main() {
 	// SelectTest()
 	// ChannelTest()
 	// TimerTest()
-	ArrayTest()
+	//ArrayTest()
 	// SliceTest()
 	// DeferTest()
 	// ChanTest()
+	StringTest()
 }

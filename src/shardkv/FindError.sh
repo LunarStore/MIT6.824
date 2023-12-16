@@ -2,7 +2,7 @@
   
 # nohup ./mybash.sh &后台执行
 # 命令  
-COMMAND="go test -run TestConcurrent2"
+COMMAND="go test -run TestConcurrent1"
   
 # 输出文件  
 OUTPUT_FILE="DEBUG1.txt"  
